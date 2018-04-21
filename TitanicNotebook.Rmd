@@ -1,0 +1,548 @@
+---
+title: "Notebook for Titanic"
+output:
+  html_notebook: default
+  pdf_document: default
+---
+From Na Peng
+
+1. Introduction
+In this Notebook, we are focusing on Feature Engineering and how it would impact the regression method.
+
+1.1 Loading libraries and data
+```{r}
+library(ISLR)
+library(tidyverse)
+library(ggplot2)
+library(MASS)
+library(car)
+library(psych)
+library(gridExtra)
+library(mice)
+library(glmnet)
+library(caret)
+library(randomForest)
+library(tree)
+library(e1071)
+library(caret)
+library(class)
+library(naivebayes)
+
+
+train<-read.csv("Titanic_Train.csv", header=T)
+train<-train %>%
+  mutate(Survived=factor(Survived), Pclass=factor(Pclass))
+test<-read.csv("test.csv", header=T)
+test<-test %>%
+  mutate(Pclass=factor(Pclass))%>%
+  mutate(Survived=rep(0,418))
+
+##Here, I will combine test and train so to get a global of the data
+
+titanic<-rbind(train, test)
+
+```
+
+2. Data Pre-processing and Exploratory Data Analysis
+
+2.1 Missing data?
+```{r}
+str(titanic)
+```
+Notice there are "NA" in Age and factor level " " in Cabin and Embarked. To get a better view, we replace "" by NA and count.
+```{r}
+titanic[titanic==""]=NA
+summary(is.na(titanic))
+```
+From the data, we see that there are significant missing data in Cabin and Age, 1 from Fare and 2 from Embarked. We will investigate each separetly. 
+
+2.2 Fare
+
+1 person from test misses "Fare" data. We suspect fare is mostly relevant with the Pclass and possibly Embarked. 
+```{r}
+titanic[is.na(titanic$Fare),]
+```
+```{r}
+ggplot(test)+geom_boxplot(aes(x=Embarked, y=Fare))+facet_wrap(~Pclass, nrow=1)
+```
+The plot shows that we should consider both Pclass and Embarked, and Fare is not normally distributed. We will replace it with the median
+```{r}
+MissingClass<-titanic[is.na(titanic$Fare), "Pclass"]
+MissingEmbarked<-titanic[is.na(titanic$Fare), "Embarked"]
+B=titanic[titanic$Pclass==MissingClass,]
+B=B[B$Embarked==MissingEmbarked, "Fare"]
+titanic[is.na(titanic$Fare), "Fare"]=median(B, na.rm=T)
+```
+
+2.3 Embarked
+
+We only miss 2 entries here and they are both in train. Since Embarked has only 3 levels. So we will just replace it with the most frequent one
+```{r}
+summary(titanic$Embarked, na.rm=T)
+titanic[is.na(titanic$Embarked), "Embarked"]="S"
+```
+
+2.4 Cabin
+
+Looking in all rows with existing Cabins, we see that the majority of them are from Class 1. But with such a high missing rate, it is hard to fill. Instead, we will just compare the significance of having a cabin. As we can tell from the graph, the predictor is relevant to survival rate.  
+```{r}
+titanic<-titanic%>%
+  mutate(NoCabin=is.na(Cabin))
+train<-train %>%
+  mutate(NoCabin=is.na(Cabin))
+
+ggplot(train)+geom_bar(aes(x=NoCabin, fill=Survived))+facet_wrap(~Pclass,nrow=1)+labs(title="Within each class, Survival rate vs Ownership of a Cabin")
+```
+
+
+2.5 Age
+
+20% of Age are missing, we will use the mice library to impute the missing ages. Here, We will apply and compare 2 method, random forest/classification and regression trees.
+```{r}
+factors <- c("PassengerId", "Name", "Cabin")
+set.seed(1)
+
+temp <- titanic[, !names(titanic) %in% factors]
+  
+mice_ages <- mice(temp, method='rf')
+
+titanic<-titanic %>%
+  mutate(Age.rf=complete(mice_ages)$Age)
+```
+
+Now we look into the relation between Age and Survive rate. Judging by the graph, AgeBracket is more appropriate. For people older than 60, their chance of surviving is universally lower. Age 18 could be another cut and look closely,  we will set 8 as first cutoff.
+
+```{r}
+train$Age.rf<-titanic$Age.rf[1:nrow(train)]
+plot1 = ggplot(train)+geom_density(alpha=0.5, aes(x=Age.rf, fill=Survived))+labs(title="Survival density for Age")
+
+plot2 = ggplot(train%>% filter(Age.rf<=18))+geom_bar(alpha=0.5, aes(x=Age.rf, fill=Survived))+labs(title="Survival count for Age<=18")
+grid.arrange(plot1, plot2, ncol=1)
+
+cutoff<-c(0,8, 18, 60)
+
+titanic<-titanic %>%
+  mutate(Age.rf=findInterval(Age.rf, cutoff, left.open=T))%>%
+  mutate(Age.rf=as.factor(Age.rf))
+
+```
+
+3. Feature Engineering
+
+Since we have filled many missing data, we will need to updata the combined data set
+```{r}
+train<-titanic[1:891, ]
+
+test<-titanic[892:1309,]
+
+```
+In the following, we are expore the possible transformation needed and interactions among predictors
+
+3.1 Pclass
+
+As expected, there is a strong correlation between Survive and Pclass. But when separated by Sex, the change of survival rate differs. So we could consider a Sex:Pclass term to regression.
+```{r}
+ggplot(train)+geom_bar(aes(x=Pclass, fill=Survived))+facet_wrap(~Sex, nrow=1)+labs(title="Survival rate among classes, split by gender")
+```
+
+3.2 Ticket
+
+We look into Ticket and the first thing we notice is that there are few tickets than passengers. So some tickets are shared
+```{r}
+length(unique(titanic$Ticket))
+
+nrow(titanic)
+```
+So we start by looking into how tickets are shared. Clearly, the pattern varies among different class, so we will consider the term ticket.shared:Pclass
+```{r}
+titanic_tik<- titanic[,c("PassengerId","Ticket")]%>%
+  group_by(Ticket) %>%
+  summarise(total.count=n())
+
+titanic$ticket.shared<-titanic_tik$total.count[match(titanic$Ticket, titanic_tik$Ticket)]
+train$ticket.shared<-titanic$ticket.shared[1:891]
+ 
+test$ticket.shared<-titanic$ticket.shared[892:1309]
+ 
+# test$ticket.shared<-ifelse(test$ticket.shared<=2, train$ticket.shared, 3)
+
+```
+
+3.3 Fare
+
+The Fare from Class 1 is simply too high compared with Class 2 and 3 
+```{r}
+ggplot(titanic)+geom_boxplot(aes(x=Pclass, y=Fare))
+```
+Looking into the Fare closely, we see that those passengers with outrageous high Fare price seems to have their tickets shared. So instead, we will consider Fare per person.
+```{r}
+head(titanic[order(-titanic$Fare),],10)
+titanic$FarePP<-titanic$Fare/titanic$ticket.shared
+```
+
+Unfortunately, there were some 0 Fares, with passengers coming from different Age, Sex and Pclass. So as Fare is mostly like correlated with Class, we will replace it with the Class median
+```{r}
+head(titanic[titanic$FarePP==0,])
+FareMed<- titanic[titanic$FarePP>0,]%>%
+  group_by(Pclass)%>%
+  summarise(MedFare=median(FarePP))
+
+titanic$FarePP[titanic$FarePP==0]<-FareMed$MedFare[match(titanic$Pclass, FareMed$Pclass)][titanic$FarePP==0]
+```
+
+It does not come as a surprise that Fare is correlated to Class. We will just use the quantile to transform FarePP into categorized variable Fare1. Judging by the graph, Sex and Age interacts.
+```{r}
+cutoff=cbind(quantile(titanic$FarePP, 0.2),quantile(titanic$FarePP, 0.4),quantile(titanic$FarePP, 0.6),quantile(titanic$FarePP, 0.8))
+
+titanic$Fare1<-findInterval(titanic$FarePP, cutoff, rightmost.closed = F, left.open=T)
+
+train<-train %>%
+  mutate(Fare1=titanic$Fare1[1:891])%>%
+  mutate(Fare1=as.factor(Fare1))
+
+test<-test %>%
+  mutate(Fare1=titanic$Fare1[892:1309])%>%
+  mutate(Fare1=as.factor(Fare1))
+
+ggplot(train)+geom_bar(alpha=0.5,aes(x=Fare1, fill=Survived))+facet_wrap(~Pclass, ncol=3)
+```
+3.4 GroupSize
+
+Since SibSp and Parch combined to make other family members, we introduce a new variable Family to include all. Judging by the graph, the survival rate pattern is consistent among the 4. We run a logistic regression and pick ticket.shared.
+
+```{r}
+train<-train %>%
+  mutate(SibSp=titanic[1:891, "SibSp"])%>%
+  mutate(Parch=titanic[1:891, "Parch"])%>%
+  mutate(Family=SibSp+Parch+1)%>%
+  mutate(ticket.shared=titanic$ticket.shared[1:dim(train)[1]])%>%
+  mutate(Family=as.factor(Family))%>%
+  mutate(ticket.shared=as.factor(ticket.shared))
+
+plot1=ggplot(train)+geom_bar(aes(x=SibSp, fill=Survived))
+plot2=ggplot(train)+geom_bar(aes(x=Parch, fill=Survived))
+plot3=ggplot(train)+geom_bar(aes(x=Family, fill=Survived))
+plot4=ggplot(train)+geom_bar(aes(x=ticket.shared, fill=Survived))
+grid.arrange(plot1, plot2,plot3,plot4,ncol=2)
+
+fit<-glm(Survived~ticket.shared, data=train, family="binomial")
+
+fit2<-glm(Survived~Family, data=train, family="binomial")
+rbind(summary(fit)$coefficient, summary(fit2)$coefficient)
+
+```
+From the coefficient table, we see that when ticket.share>4, it is no longer significant, so we will cap it at 4.
+```{r}
+titanic<-titanic%>%
+mutate(ticket.shared=ifelse((ticket.shared %in% 1:4), ticket.shared, 4))
+
+train<-train%>%
+  mutate(ticket.shared=titanic$ticket.shared[1:891])%>%
+  mutate(ticket.shared=as.factor(ticket.shared))
+
+test<-test%>%
+  mutate(ticket.shared=titanic$ticket.shared[892:1309])%>%
+  mutate(ticket.shared=as.factor(ticket.shared))
+
+ggplot(train)+geom_bar(aes(x=ticket.shared, fill=Survived))+facet_wrap(~Pclass, ncol=3)
+```
+
+3.5 Title
+
+We will looking into the interaction between Age and Sex bylooking into title.
+```{r}
+titanic$Title <- gsub('(.*, )|(\\..*)', '', titanic$Name)
+
+table(titanic$Title)
+```
+It turns out some of the Title stands for relatively high social status, so we will group them together.
+```{r}
+High <- c("Capt","Col","Don","Dona","Dr","Jonkheer","Lady","Major",
+         "Mlle", "Mme","Rev","Sir","the Countess")
+
+titanic$Title[titanic$Title %in% High] <- "High"
+titanic$Title <- as.factor(titanic$Title)
+
+table(titanic$Title)
+```
+For the rest, we will simply combine Mrs and Ms, and expect to get 4 groups AdultMale(Mr), AdultFemale(Mrs), YoungMale(Master) and YoungFemale(Miss). The Age cutoff might not fall nicely with our Age.rf.
+```{r}
+titanic$Title[titanic$Title=="Ms"]<-"Mrs"
+
+train$Title<-titanic$Title[1:dim(train)[1]]
+test$Title<-titanic$Title[892:1309]
+
+ggplot(train)+geom_bar(aes(x=Title, fill=Survived))+facet_wrap(~Pclass, ncol=3)
+
+```
+
+4. Model
+
+Now, for the purpose of comparing different models, we split the existing train set to train.x.train and train.x.test.
+```{r}
+seed<-sample(1:1000, 25, replace=F) #Seeds are chosen here so same set of sample will be generated for each model
+```
+
+
+```{r}
+train.x<-train[,c("Survived", "Pclass", "Sex", "Age.rf", "Fare1", "Embarked","ticket.shared", "NoCabin", "Title")]%>%
+  mutate(NoCabin=factor(NoCabin))
+
+Accuracy<-data.frame(Model=rep(c("Logistic +Pclass:Sex+ ticket.shared:Pclass-Fare1"),10))
+
+Accuracy=merge(Accuracy, as.data.frame(matrix(1:25, ncol=25)))
+Accuracy$Model<-as.character(Accuracy$Model)
+
+```
+
+4.1 Logistic Regression with Lasso or Rigid
+
+Now, we start with the first round. Our goal here is to repeatedly eliminate unsignificant predictors until all left are significant. 
+```{r}
+for(i in 1:25){
+  set.seed(seed[i])
+  index=sample(1:dim(train.x)[1], 0.8*dim(train.x)[1], replace=F)
+  train.x.train=train.x[index,]
+  train.x.test=train.x[-index,]
+  logistic.fit<-glm(Survived~.+Pclass:Sex+ticket.shared:Pclass-Fare1, data=train.x.train, family="binomial")
+  pred<-predict(logistic.fit, newdata=train.x.test, type="response")
+  pred<-ifelse(pred>=1.5, 2, 1)
+  Accuracy[1,1+i]=mean(train.x.test$Survived==pred)
+  #Penalty
+  y1=train.x.train$Survived
+  y1<-as.numeric(y1)
+  x1<-model.matrix(Survived~.+Pclass:Sex+ ticket.shared:Pclass-Fare1, data=train.x.train, family=binomial)[,-1]
+  x2<-model.matrix(Survived~.+Pclass:Sex+ ticket.shared:Pclass-Fare1, data=train.x.test, family=binomial)[,-1]
+  #Lasso
+  cv.out<-cv.glmnet(x1,y1,alpha=1, family="binomial", type.measure="mse")
+  bestlam<-cv.out$lambda.1se
+  lasso.mod<-glmnet(x1,y1,alpha=1, lambda=bestlam)
+  pred<-predict(lasso.mod, newx=x2, type="response")
+  pred<-ifelse(pred>=1.5, 2, 1)
+  Accuracy[2,1+i]=mean(train.x.test$Survived==pred)
+  #Rigid
+  cv.out<-cv.glmnet(x1,y1,alpha=0, family="binomial", type.measure="mse")
+  bestlam<-cv.out$lambda.1se
+  rigid.mod<-glmnet(x1,y1,alpha=0, lambda=bestlam)
+  pred<-predict(rigid.mod, newx=x2, type="response")
+  pred<-ifelse(pred>=1.5, 2, 1)
+  Accuracy[3,1+i]=mean(train.x.test$Survived==pred)
+}  
+# Accuracy[2,1]=c("Lasso")
+# Accuracy[3,1]=c("Rigid")
+```
+
+Next, we try eliminate Sex and ticket.shared.
+```{r}
+for(i in 1:25){
+  set.seed(seed[i])
+  index=sample(1:dim(train.x)[1], 0.8*dim(train.x)[1], replace=F)
+  train.x.train=train.x[index,]
+  train.x.test=train.x[-index,]
+  logistic.fit<-glm(Survived~.+Pclass:Sex+ ticket.shared:Pclass-Sex-ticket.shared, data=train.x.train, family="binomial")
+  pred<-predict(logistic.fit, newdata=train.x.test, type="response")
+  pred<-ifelse(pred>=0.5, 2, 1)
+  Accuracy[4,1+i]=mean(train.x.test$Survived==pred)
+  #Penalty
+  y1=train.x.train$Survived
+  y1<-as.numeric(y1)
+  x1<-model.matrix(Survived~.-Sex-ticket.shared+Pclass:Sex+ ticket.shared:Pclass, data=train.x.train, family=binomial)[,-1]
+  x2<-model.matrix(Survived~.-Sex-ticket.shared+Pclass:Sex+ ticket.shared:Pclass, data=train.x.test, family=binomial)[,-1]
+  #Lasso
+  cv.out<-cv.glmnet(x1,y1,alpha=1, family="binomial", type.measure="mse")
+  bestlam<-cv.out$lambda.1se
+  lasso.mod<-glmnet(x1,y1,alpha=1, lambda=bestlam)
+  pred<-predict(lasso.mod, newx=x2, type="response")
+  pred<-ifelse(pred>=1.5, 2, 1)
+  Accuracy[5,1+i]=mean(train.x.test$Survived==pred)
+  #Rigid
+  cv.out<-cv.glmnet(x1,y1,alpha=0, family="binomial", type.measure="mse")
+  bestlam<-cv.out$lambda.1se
+  rigid.mod<-glmnet(x1,y1,alpha=0, lambda=bestlam)
+  pred<-predict(rigid.mod, newx=x2, type="response")
+  pred<-ifelse(pred>=1.5, 2, 1)
+  Accuracy[6,1+i]=mean(train.x.test$Survived==pred)
+}
+Accuracy[4,1]=c("Logistic -Sex-ticket.shared+Pclass:Sex+ ticket.shared:Pclass")
+Accuracy[5,1]=c("Lasso")
+Accuracy[6,1]=c("Rigid")
+
+```
+
+4.3 RandomForest
+We tried to drop Age.rf, Embarked or NoCabin, those with lowest importance in Accuracy, but none comes out better than full features. Then, we tried to drop Fare1, as in the logistic regression model, this time it gives best Accuracy Performance
+```{r}
+
+for(i in 1:25){
+  set.seed(seed[i])
+  index=sample(1:dim(train.x)[1], 0.8*dim(train.x)[1], replace=F)
+  train.x.train=train.x[index,]
+  train.x.test=train.x[-index,]
+  rf<-randomForest(Survived~.-Fare1, data=train.x.train, importance=T, mtry=3,nstart=250)
+  pred<-predict(rf, newdata=train.x.test, type="response")
+  Accuracy[7,1+i]=mean(train.x.test$Survived==pred)
+#  print(which.min(importance(rf, type=1)))
+}
+Accuracy[7,1]=c("RandomForest with -Fare1. mtry=3")
+```
+
+4.4 KNN
+
+Since all predictors from train.x are categorical, it is tempting to use KNN with Hamming Distance. Prior of that, let look closely into our full titanic data, we see , for exmaple, there are 78 adult males from class 3, alone and without Cabin, all Embarked at port S, with same Fare bracket. It would be close to random to pick any, say 5, of such neighbors using Hamming Distance and find the survival rate. 
+```{r}
+grouped<-train%>%
+  group_by(Pclass, NoCabin, Embarked, ticket.shared, Age.rf, Title, Fare1)%>%
+  summarize(count=n())
+head(grouped[order(-grouped$count),])
+```
+We will still give it a try, after trials, we picked all-Fare1 as the features
+
+```{r}
+train.x$Survived<-as.integer(train.x$Survived)
+dummies<-dummyVars(~.-Fare1, data=train.x)
+train.x.dum<-data.frame(predict(dummies, newdata=train.x))
+train.x.dum$Survived<-as.factor(train.x.dum$Survived)
+
+trctrl<-trainControl(method="repeatedcv", number=10, repeats=10)
+
+for(i in 1:25){
+  set.seed(seed[i])
+  index=sample(1:dim(train.x)[1], 0.8*dim(train.x)[1], replace=F)
+  train.x.train=train.x.dum[index,]
+  train.x.test=train.x.dum[-index,]
+  knn.fit<-train(Survived~., data=train.x.train, method="knn", trControl=trctrl)
+  pred<-predict(knn.fit, newdata=train.x.test)
+  #pred<-knn(train.x.train[,-1], train.x.test[,-1], train.x.train$Survived, k=4)
+  Accuracy[8,1+i]=mean(train.x.test$Survived==pred)
+}
+Accuracy[8,1]=c("KNN with Euclidean distance -Fare1, trained by caret")
+train.x$Survived<-as.factor(train.x$Survived)
+```
+
+4.5 GBM
+```{r}
+trctrl<-trainControl(method="repeatedcv", number=10)
+for(i in 1:25){
+  set.seed(seed[i])
+  index=sample(1:dim(train.x)[1], 0.8*dim(train.x)[1], replace=F)
+  train.x.train=train.x[index,]
+  train.x.test=train.x[-index,]
+  GBM.fit<-suppressWarnings(train(Survived~.-Fare1, data=train.x.train, method="gbm", preProcess= c('center', 'scale'), trControl=trctrl, verbose=F))
+  pred<-predict(GBM.fit, newdata=train.x.test, type="prob")
+  pred<-ifelse(pred[,2]>0.5, 2, 1)
+  Accuracy[10,1+i]=mean(train.x.test$Survived==pred)
+}
+Accuracy[10,1]=c("GBM with -Fare1")
+
+A=apply(Accuracy[,2:26],1,mean)
+A
+```
+4.6 SVM
+```{r}
+trctrl<-trainControl(method="repeatedcv", number=10)
+
+for(i in 1:25){
+  set.seed(seed[i])
+  index=sample(1:dim(train.x)[1], 0.8*dim(train.x)[1], replace=F)
+  train.x.train=train.x[index,]
+  train.x.test=train.x[-index,]
+  SVM.fit<-suppressWarnings(train(Survived~.-Age.rf, data=train.x.train, method="svmRadial",preProcess= c('center', 'scale'), trControl=trctrl))
+  pred<-predict(SVM.fit, newdata=train.x.test)
+  Acc[1+i]=mean(train.x.test$Survived==pred)
+}
+Accuracy[9,1]=c("SVM with -Fare1, trained by caret")
+```
+
+4.7 Model selection and Majority Vote
+
+First, we look the average accuracy performance
+```{r}
+A=apply(Accuracy[,2:26],1,mean)
+Accuracy$Average=A
+head(Accuracy[order(-Accuracy$Average),c(1,27)]) #Arranged by Average Accuracy
+```
+Then we look into the average rank
+
+```{r}
+Accuracy_rank<-Accuracy
+for(i in 2:26){
+  Accuracy_rank[,i]=rank(Accuracy[,i])
+}
+Accuracy_rank$Average=apply(Accuracy_rank[,2:26],1, mean)
+head(Accuracy_rank[order(-Accuracy_rank$Average),c(1,27)]) #Arranged by Average Accuracy Rank
+```
+Judging by both, we will pick the top 5 models, run on the test data and take the simple majority.
+  
+Prepare test
+```{r}
+test<-titanic[892:1309, c("Survived", "Pclass", "Sex", "Age.rf", "Fare1", "Embarked","ticket.shared", "NoCabin", "Title")] %>%
+  mutate(NoCabin=as.factor(NoCabin))%>%
+  mutate(Fare1=as.factor(Fare1))%>%
+  mutate(ticket.shared=as.factor(ticket.shared))
+```
+
+Logistic regression with Lasso, features are .+Pclass:Sex+ ticket.shared:Pclass-Fare1. Rigid behaves well in training but behaves bad with real test data. 
+```{r}
+#Penalty
+y1=train.x$Survived
+y1<-as.numeric(y1)
+x1<-model.matrix(Survived~.+Pclass:Sex+ ticket.shared:Pclass-Fare1, data=train.x, family=binomial)[,-1]
+x2<-model.matrix(Survived~.+Pclass:Sex+ ticket.shared:Pclass-Fare1, data=test, family=binomial)[,-1]
+
+cv.out<-cv.glmnet(x1,y1,alpha=1, family="binomial", type.measure="mse")
+bestlam<-cv.out$lambda.1se
+lasso.mod<-glmnet(x1,y1,alpha=1, lambda=bestlam)
+pred.lasso<-predict(lasso.mod, newx=x2, type="response")
+pred.lasso<-ifelse(pred.lasso>=1.5, 1, 0)
+```
+
+SVM with -Fare1, trained by caret. This turns out to be the best model so far.
+```{r}
+trctrl<-trainControl(method="repeatedcv", number=10)
+
+SVM.fit1<-suppressWarnings(train(Survived~.-Fare1, data=train.x, method="svmRadial",preProcess= c('center', 'scale'), trControl=trctrl))
+pred.SVM1<-predict(SVM.fit1, newdata=test)
+pred.SVM1<-ifelse(pred.SVM1==2, 1, 0)
+```
+
+RandomForest with -Fare1. mtry=3
+```{r}
+rf_age<-randomForest(Survived~.-Age.rf, data=train.x, importance=T, mtry=5,nstart=250)
+pred.rf1<-predict(rf_age, newdata=test, type="response")
+pred.rf1<-ifelse(pred.rf1==2, 1, 0)
+```
+
+Logistic regression with Rigid, features are .+Pclass:Sex+ ticket.shared:Pclass-Sex-ticket.shared. Rigid behaves well in training but behaves bad with real test data. 
+```{r}
+#Penalty
+y1=train.x$Survived
+y1<-as.numeric(y1)
+x1<-model.matrix(Survived~.+Pclass:Sex+ ticket.shared:Pclass-Sex-ticket.shared, data=train.x, family=binomial)[,-1]
+x2<-model.matrix(Survived~.+Pclass:Sex+ ticket.shared:Pclass-Sex-ticket.shared, data=test, family=binomial)[,-1]
+
+cv.out<-cv.glmnet(x1,y1,alpha=0, family="binomial", type.measure="mse")
+bestlam<-cv.out$lambda.1se
+rigid.mod<-glmnet(x1,y1,alpha=0, lambda=bestlam)
+pred.rigid2<-predict(rigid.mod, newx=x2, type="response")
+pred.rigid2<-ifelse(pred.rigid2>=1.5, 1, 0)
+```
+
+GBM with -Fare1
+```{r}
+trctrl<-trainControl(method="repeatedcv", number=10)
+
+GBM.fit<-suppressWarnings(train(Survived~.-Fare1, data=train.x, method="gbm", preProcess= c('center', 'scale'), trControl=trctrl, verbose=F))
+pred.GBM<-predict(GBM.fit, newdata=test, type="prob")
+pred.GBM<-ifelse(pred.GBM[,2]>0.5, 1, 0)
+```
+
+```{r}
+test.fit=pred.GBM+pred.rf+pred.SVM+pred.rigid1+pred.rigid2
+test.fit<-ifelse(test.fit>=3,1,0)
+test1<-read.csv("test.csv", header=T)
+MajFit<-data.frame(PassengerId=rep(0, 418))
+MajFit$PassengerId<-test1$PassengerId
+MajFit$Survived=test.fit
+write.csv(MajFit, "MajFit.CSV", row.names=F)
+```
+
